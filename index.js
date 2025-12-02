@@ -1,5 +1,8 @@
 const express = require('express');
 const axios = require('axios');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -269,14 +272,15 @@ app.get('/', (req, res) => {
         url: 'GET /video/:id',
         description: 'Récupère les informations d\'une vidéo spécifique'
       },
-      download: {
-        url: 'GET /download?video=URL_VIDEO',
-        description: 'Télécharge une vidéo via proxy (contourne les restrictions)',
-        exemple: '/download?video=URL_VIDEO_360p_ou_720p'
+      telecharger: {
+        url: 'GET /telecharger/:videoId?quality=720',
+        description: 'TELECHARGE LE FILM COMPLET EN MP4 (peut prendre plusieurs minutes)',
+        exemple: '/telecharger/x8fme0n?quality=360',
+        qualites: ['360 = basse qualité, fichier plus petit', '720 = haute qualité, fichier plus gros']
       },
       stream: {
         url: 'GET /stream/:videoId?quality=720',
-        description: 'Stream une vidéo par son ID via proxy (quality: 360 ou 720)',
+        description: 'Stream HLS pour lecteurs vidéo (VLC, MX Player)',
         exemple: '/stream/x8fme0n?quality=360'
       }
     },
@@ -528,6 +532,117 @@ app.get('/stream/:videoId', async (req, res) => {
       erreur: 'Erreur lors du streaming',
       message: error.message
     });
+  }
+});
+
+const downloadProgress = new Map();
+
+app.get('/telecharger/:videoId', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { quality = '720' } = req.query;
+    
+    if (!videoId) {
+      return res.status(400).json({
+        erreur: 'ID de vidéo requis',
+        exemple: '/telecharger/x8fme0n?quality=360'
+      });
+    }
+    
+    console.log(`\n=== Téléchargement MP4: ${videoId} (${quality}p) ===`);
+    
+    const metadata = await getVideoMetadata(videoId);
+    if (!metadata) {
+      return res.status(404).json({
+        erreur: 'Vidéo non trouvée'
+      });
+    }
+    
+    const { url_360p, url_720p } = extractVideoUrls(metadata);
+    
+    let streamUrl = quality === '360' ? url_360p : url_720p;
+    if (!streamUrl) {
+      streamUrl = url_720p || url_360p;
+    }
+    
+    if (!streamUrl) {
+      return res.status(404).json({
+        erreur: 'Aucun flux vidéo disponible'
+      });
+    }
+    
+    const title = metadata.title ? metadata.title.replace(/[^a-zA-Z0-9\s]/g, '').substring(0, 50) : videoId;
+    const filename = `${title}_${quality}p.mp4`;
+    
+    console.log('Stream URL:', streamUrl.substring(0, 80) + '...');
+    console.log('Filename:', filename);
+    
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    
+    const ffmpegArgs = [
+      '-headers', `User-Agent: ${headers['User-Agent']}\r\nReferer: https://www.dailymotion.com/\r\nOrigin: https://www.dailymotion.com`,
+      '-i', streamUrl,
+      '-c', 'copy',
+      '-bsf:a', 'aac_adtstoasc',
+      '-movflags', 'frag_keyframe+empty_moov+faststart',
+      '-f', 'mp4',
+      'pipe:1'
+    ];
+    
+    console.log('Starting ffmpeg...');
+    
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    
+    let totalBytes = 0;
+    
+    ffmpeg.stdout.on('data', (data) => {
+      totalBytes += data.length;
+      if (totalBytes % (1024 * 1024) < 65536) {
+        console.log(`Downloaded: ${(totalBytes / (1024 * 1024)).toFixed(1)} MB`);
+      }
+      res.write(data);
+    });
+    
+    ffmpeg.stderr.on('data', (data) => {
+      const msg = data.toString();
+      if (msg.includes('time=')) {
+        const timeMatch = msg.match(/time=(\d{2}:\d{2}:\d{2})/);
+        if (timeMatch) {
+          console.log(`Progress: ${timeMatch[1]}`);
+        }
+      }
+    });
+    
+    ffmpeg.on('close', (code) => {
+      console.log(`ffmpeg finished with code ${code}, total: ${(totalBytes / (1024 * 1024)).toFixed(1)} MB`);
+      res.end();
+    });
+    
+    ffmpeg.on('error', (err) => {
+      console.error('ffmpeg error:', err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ erreur: 'Erreur ffmpeg', message: err.message });
+      }
+    });
+    
+    req.on('close', () => {
+      console.log('Client disconnected, killing ffmpeg');
+      ffmpeg.kill('SIGTERM');
+    });
+    
+  } catch (error) {
+    console.error('Download error:', error.message);
+    if (!res.headersSent) {
+      res.status(500).json({
+        erreur: 'Erreur lors du téléchargement',
+        message: error.message
+      });
+    }
   }
 });
 
