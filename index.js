@@ -1,6 +1,5 @@
 const express = require('express');
 const axios = require('axios');
-const cheerio = require('cheerio');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -15,23 +14,9 @@ const PLAYER_METADATA_URL = 'https://www.dailymotion.com/player/metadata/video';
 
 const headers = {
   'User-Agent': 'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept': 'application/json',
   'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-  'Referer': 'https://www.dailymotion.com/',
 };
-
-async function fetchPage(url) {
-  try {
-    const response = await axios.get(url, {
-      headers,
-      timeout: 30000
-    });
-    return response.data;
-  } catch (error) {
-    console.error('Erreur fetch:', error.message);
-    throw error;
-  }
-}
 
 async function getVideoMetadata(videoId) {
   try {
@@ -45,7 +30,6 @@ async function getVideoMetadata(videoId) {
     });
     return response.data;
   } catch (error) {
-    console.error('Erreur metadata pour', videoId, ':', error.message);
     return null;
   }
 }
@@ -103,7 +87,6 @@ function extractVideoUrls(metadata) {
     
     return { url_360p, url_720p };
   } catch (error) {
-    console.error('Erreur extraction URLs:', error.message);
     return { url_360p: null, url_720p: null };
   }
 }
@@ -119,147 +102,86 @@ function formatDuration(seconds) {
   return `${minutes}m${secs.toString().padStart(2, '0')}s`;
 }
 
-function parseDurationFromText(durationText) {
-  if (!durationText) return 0;
-  
-  const parts = durationText.split(':').map(p => parseInt(p) || 0);
-  
-  if (parts.length === 3) {
-    return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  } else if (parts.length === 2) {
-    return parts[0] * 60 + parts[1];
-  }
-  return 0;
-}
-
-async function searchVideos(query, page = 1) {
+async function searchVideos(query, page = 1, minResults = 10) {
   const minDurationSeconds = 90 * 60;
   const results = [];
+  const seenIds = new Set();
   
-  try {
-    const searchUrl = `https://www.dailymotion.com/search/${encodeURIComponent(query)}/top-results`;
-    console.log('Fetching search page:', searchUrl);
-    
-    const html = await fetchPage(searchUrl);
-    const $ = cheerio.load(html);
-    
-    const videoIds = new Set();
-    
-    $('a[href*="/video/"]').each((i, el) => {
-      const href = $(el).attr('href');
-      if (href) {
-        const match = href.match(/\/video\/([a-zA-Z0-9]+)/);
-        if (match && match[1]) {
-          videoIds.add(match[1]);
-        }
-      }
-    });
-    
-    const scriptContent = $('script').map((i, el) => $(el).html() || '').get().join('\n');
-    
-    const xidMatches = scriptContent.match(/"xid"\s*:\s*"([a-zA-Z0-9]+)"/g);
-    if (xidMatches) {
-      xidMatches.forEach(match => {
-        const id = match.match(/"xid"\s*:\s*"([a-zA-Z0-9]+)"/);
-        if (id && id[1]) {
-          videoIds.add(id[1]);
-        }
-      });
-    }
-    
-    const videoIdMatches = scriptContent.match(/\/video\/([a-zA-Z0-9]+)/g);
-    if (videoIdMatches) {
-      videoIdMatches.forEach(match => {
-        const id = match.match(/\/video\/([a-zA-Z0-9]+)/);
-        if (id && id[1]) {
-          videoIds.add(id[1]);
-        }
-      });
-    }
-    
-    console.log('Found video IDs from HTML:', videoIds.size);
-    
-    if (videoIds.size === 0) {
-      console.log('Trying Dailymotion API...');
-      const apiUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(query)}&fields=id,title,thumbnail_720_url,thumbnail_480_url,thumbnail_url,duration,owner.screenname&page=${page}&limit=50&sort=relevance`;
+  console.log(`\n=== Recherche: "${query}" - Page: ${page} ===`);
+  
+  let currentApiPage = (page - 1) * 5 + 1;
+  let maxApiPages = currentApiPage + 10;
+  let hasMore = true;
+  let totalAvailable = 0;
+  
+  while (results.length < minResults && currentApiPage <= maxApiPages && hasMore) {
+    try {
+      const apiUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(query)}&fields=id,title,thumbnail_720_url,thumbnail_480_url,thumbnail_url,duration,owner.screenname&page=${currentApiPage}&limit=100&sort=relevance`;
       
-      try {
-        const apiResponse = await axios.get(apiUrl, {
-          headers: { 'User-Agent': headers['User-Agent'] },
-          timeout: 20000
-        });
-        
-        if (apiResponse.data && apiResponse.data.list) {
-          apiResponse.data.list.forEach(video => {
-            if (video.id) videoIds.add(video.id);
-          });
-          console.log('Found video IDs from API:', videoIds.size);
-        }
-      } catch (apiErr) {
-        console.log('API error:', apiErr.message);
-      }
-    }
-    
-    const startIdx = (page - 1) * 10;
-    const videoIdArray = Array.from(videoIds);
-    console.log('Processing videos starting from index:', startIdx);
-    
-    let processedCount = 0;
-    let skippedCount = 0;
-    
-    for (const videoId of videoIdArray) {
-      if (results.length >= 10) break;
+      console.log(`Fetching API page ${currentApiPage}...`);
       
-      try {
-        const metadata = await getVideoMetadata(videoId);
+      const response = await axios.get(apiUrl, {
+        headers: { 'User-Agent': headers['User-Agent'] },
+        timeout: 20000
+      });
+      
+      if (response.data && response.data.list) {
+        const allVideos = response.data.list;
+        totalAvailable = response.data.total || 0;
+        hasMore = response.data.has_more || false;
         
-        if (metadata) {
-          const duration = metadata.duration || 0;
+        console.log(`Page ${currentApiPage}: ${allVideos.length} videos, total available: ${totalAvailable}`);
+        
+        const longVideos = allVideos.filter(v => v.duration >= minDurationSeconds && !seenIds.has(v.id));
+        console.log(`Videos >= 1h30 on this page: ${longVideos.length}`);
+        
+        for (const video of longVideos) {
+          if (results.length >= minResults) break;
+          if (seenIds.has(video.id)) continue;
+          seenIds.add(video.id);
           
-          if (duration >= minDurationSeconds) {
+          try {
+            const metadata = await getVideoMetadata(video.id);
             const { url_360p, url_720p } = extractVideoUrls(metadata);
             
             results.push({
-              titre: metadata.title || 'Sans titre',
-              image_url: metadata.poster_url || metadata.thumbnail_url || `https://www.dailymotion.com/thumbnail/video/${videoId}`,
+              titre: video.title || 'Sans titre',
+              image_url: video.thumbnail_720_url || video.thumbnail_480_url || video.thumbnail_url || `https://www.dailymotion.com/thumbnail/video/${video.id}`,
               video_url_360p: url_360p || null,
               video_url_720p: url_720p || null,
-              video_id: videoId,
-              duree: formatDuration(duration),
-              duree_secondes: duration,
+              video_id: video.id,
+              duree: formatDuration(video.duration),
+              duree_secondes: video.duration,
               qualites_disponibles: [url_360p ? '360p' : null, url_720p ? '720p' : null].filter(Boolean),
-              page_url: `https://www.dailymotion.com/video/${videoId}`
+              chaine: video['owner.screenname'] || '',
+              page_url: `https://www.dailymotion.com/video/${video.id}`
             });
             
-            console.log(`Video trouvée: ${metadata.title?.substring(0, 50)}... (${formatDuration(duration)})`);
-            processedCount++;
-          } else {
-            skippedCount++;
+            console.log(`+ [${results.length}] ${video.title?.substring(0, 50)}... (${formatDuration(video.duration)})`);
+          } catch (err) {
+            console.log('Erreur video:', video.id);
           }
         }
-      } catch (e) {
-        console.log(`Erreur vidéo ${videoId}:`, e.message);
+      } else {
+        hasMore = false;
       }
+      
+      currentApiPage++;
+      
+    } catch (error) {
+      console.error('API error:', error.message);
+      break;
     }
-    
-    console.log(`Résultats: ${results.length} vidéos longues trouvées, ${skippedCount} vidéos trop courtes`);
-    
-    return {
-      videos: results,
-      hasNextPage: videoIdArray.length > (startIdx + 10),
-      totalCount: results.length,
-      page: page
-    };
-    
-  } catch (error) {
-    console.error('Erreur recherche:', error.message);
-    return {
-      videos: results,
-      hasNextPage: false,
-      totalCount: 0,
-      page: page
-    };
   }
+  
+  console.log(`\nTotal résultats: ${results.length} vidéos longues durées trouvées`);
+  
+  return {
+    videos: results,
+    hasNextPage: hasMore || results.length >= minResults,
+    totalCount: totalAvailable,
+    page: page
+  };
 }
 
 async function getVideoInfo(videoId) {
@@ -324,15 +246,13 @@ app.get('/recherche', async (req, res) => {
     }
     
     const pageNum = parseInt(page) || 1;
-    console.log(`\n=== Nouvelle recherche ===`);
-    console.log(`Recherche: "${video}" - Page: ${pageNum}`);
-    
-    const result = await searchVideos(video, pageNum);
+    const result = await searchVideos(video, pageNum, 10);
     
     res.json({
       recherche: video,
       page: pageNum,
       total_resultats: result.videos.length,
+      total_disponible: result.totalCount,
       page_suivante: result.hasNextPage,
       filtre: 'Durée minimum 1h30 (90 minutes)',
       qualites: ['360p', '720p'],
