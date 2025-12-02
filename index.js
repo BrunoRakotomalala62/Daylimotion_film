@@ -224,6 +224,16 @@ app.get('/', (req, res) => {
       video: {
         url: 'GET /video/:id',
         description: 'Récupère les informations d\'une vidéo spécifique'
+      },
+      download: {
+        url: 'GET /download?video=URL_VIDEO',
+        description: 'Télécharge une vidéo à partir de son URL (360p ou 720p)',
+        exemple: '/download?video=https://www.dailymotion.com/cdn/manifest/video/xxx.m3u8...'
+      },
+      stream: {
+        url: 'GET /stream/:videoId?quality=720',
+        description: 'Stream/télécharge une vidéo par son ID (quality: 360 ou 720)',
+        exemple: '/stream/x8fme0n?quality=360'
       }
     },
     exemple: '/recherche?video=Jackie chan film&page=1',
@@ -288,6 +298,87 @@ app.get('/video/:id', async (req, res) => {
   } catch (error) {
     res.status(500).json({
       erreur: 'Erreur lors de la récupération de la vidéo',
+      message: error.message
+    });
+  }
+});
+
+app.get('/download', async (req, res) => {
+  try {
+    const { video } = req.query;
+    
+    if (!video) {
+      return res.status(400).json({
+        erreur: 'Le paramètre video (URL) est requis',
+        exemple: '/download?video=URL_VIDEO_360p_ou_720p',
+        note: 'Utilisez l\'URL video_url_360p ou video_url_720p obtenue depuis /recherche'
+      });
+    }
+    
+    const videoUrl = decodeURIComponent(video);
+    console.log('Download request for:', videoUrl);
+    
+    const videoIdMatch = videoUrl.match(/video\/([a-zA-Z0-9]+)/);
+    const filename = videoIdMatch ? `${videoIdMatch[1]}.m3u8` : 'video.m3u8';
+    
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    
+    return res.redirect(302, videoUrl);
+    
+  } catch (error) {
+    console.error('Download error:', error.message);
+    res.status(500).json({
+      erreur: 'Erreur lors du téléchargement',
+      message: error.message
+    });
+  }
+});
+
+app.get('/stream/:videoId', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const { quality = '720' } = req.query;
+    
+    if (!videoId) {
+      return res.status(400).json({
+        erreur: 'ID de vidéo requis'
+      });
+    }
+    
+    console.log(`Stream request for video ${videoId} at quality ${quality}p`);
+    
+    const metadata = await getVideoMetadata(videoId);
+    if (!metadata) {
+      return res.status(404).json({
+        erreur: 'Vidéo non trouvée'
+      });
+    }
+    
+    const { url_360p, url_720p } = extractVideoUrls(metadata);
+    
+    let streamUrl = quality === '360' ? url_360p : url_720p;
+    if (!streamUrl) {
+      streamUrl = url_720p || url_360p;
+    }
+    
+    if (!streamUrl) {
+      return res.status(404).json({
+        erreur: 'Aucun flux vidéo disponible'
+      });
+    }
+    
+    console.log('Redirecting to stream URL');
+    
+    res.setHeader('Content-Disposition', `attachment; filename="${videoId}_${quality}p.m3u8"`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    return res.redirect(302, streamUrl);
+    
+  } catch (error) {
+    console.error('Stream error:', error.message);
+    res.status(500).json({
+      erreur: 'Erreur lors du streaming',
       message: error.message
     });
   }
