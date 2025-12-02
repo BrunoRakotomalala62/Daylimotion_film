@@ -212,6 +212,50 @@ async function getVideoInfo(videoId) {
   }
 }
 
+async function proxyStream(url, res, videoId, quality) {
+  try {
+    console.log('Proxying stream:', url);
+    
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': headers['User-Agent'],
+        'Referer': 'https://www.dailymotion.com/',
+        'Origin': 'https://www.dailymotion.com',
+      },
+      responseType: 'text',
+      timeout: 30000
+    });
+    
+    let m3u8Content = response.data;
+    
+    const baseUrl = url.substring(0, url.lastIndexOf('/') + 1);
+    
+    const lines = m3u8Content.split('\n');
+    const modifiedLines = lines.map(line => {
+      if (line && !line.startsWith('#') && line.trim() !== '') {
+        if (line.startsWith('http')) {
+          return `/proxy?url=${encodeURIComponent(line.trim())}`;
+        } else {
+          return `/proxy?url=${encodeURIComponent(baseUrl + line.trim())}`;
+        }
+      }
+      return line;
+    });
+    
+    m3u8Content = modifiedLines.join('\n');
+    
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Content-Disposition', `attachment; filename="${videoId}_${quality}p.m3u8"`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    return res.send(m3u8Content);
+    
+  } catch (error) {
+    console.error('Proxy stream error:', error.message);
+    throw error;
+  }
+}
+
 app.get('/', (req, res) => {
   res.json({
     message: 'Dailymotion Scraper API',
@@ -227,12 +271,12 @@ app.get('/', (req, res) => {
       },
       download: {
         url: 'GET /download?video=URL_VIDEO',
-        description: 'Télécharge une vidéo à partir de son URL (360p ou 720p)',
-        exemple: '/download?video=https://www.dailymotion.com/cdn/manifest/video/xxx.m3u8...'
+        description: 'Télécharge une vidéo via proxy (contourne les restrictions)',
+        exemple: '/download?video=URL_VIDEO_360p_ou_720p'
       },
       stream: {
         url: 'GET /stream/:videoId?quality=720',
-        description: 'Stream/télécharge une vidéo par son ID (quality: 360 ou 720)',
+        description: 'Stream une vidéo par son ID via proxy (quality: 360 ou 720)',
         exemple: '/stream/x8fme0n?quality=360'
       }
     },
@@ -303,6 +347,86 @@ app.get('/video/:id', async (req, res) => {
   }
 });
 
+app.get('/proxy', async (req, res) => {
+  try {
+    const { url } = req.query;
+    
+    if (!url) {
+      return res.status(400).json({ erreur: 'URL requise' });
+    }
+    
+    const targetUrl = decodeURIComponent(url);
+    console.log('Proxying:', targetUrl.substring(0, 80) + '...');
+    
+    if (targetUrl.includes('.m3u8')) {
+      const response = await axios.get(targetUrl, {
+        headers: {
+          'User-Agent': headers['User-Agent'],
+          'Referer': 'https://www.dailymotion.com/',
+          'Origin': 'https://www.dailymotion.com',
+        },
+        responseType: 'text',
+        timeout: 30000
+      });
+      
+      let m3u8Content = response.data;
+      const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+      
+      const lines = m3u8Content.split('\n');
+      const modifiedLines = lines.map(line => {
+        if (line && !line.startsWith('#') && line.trim() !== '') {
+          let absoluteUrl;
+          if (line.startsWith('http')) {
+            absoluteUrl = line.trim();
+          } else if (line.startsWith('../')) {
+            const urlParts = baseUrl.split('/');
+            let relativeParts = line.trim().split('/');
+            let upCount = 0;
+            while (relativeParts[0] === '..') {
+              upCount++;
+              relativeParts.shift();
+            }
+            const newBase = urlParts.slice(0, -1 - upCount).join('/') + '/';
+            absoluteUrl = newBase + relativeParts.join('/');
+          } else {
+            absoluteUrl = baseUrl + line.trim();
+          }
+          return `/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+        }
+        return line;
+      });
+      
+      m3u8Content = modifiedLines.join('\n');
+      
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.send(m3u8Content);
+    }
+    
+    const response = await axios.get(targetUrl, {
+      headers: {
+        'User-Agent': headers['User-Agent'],
+        'Referer': 'https://www.dailymotion.com/',
+        'Origin': 'https://www.dailymotion.com',
+      },
+      responseType: 'stream',
+      timeout: 120000
+    });
+    
+    res.setHeader('Content-Type', response.headers['content-type'] || 'video/MP2T');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    response.data.pipe(res);
+    
+  } catch (error) {
+    console.error('Proxy error:', error.message);
+    res.status(500).json({
+      erreur: 'Erreur proxy',
+      message: error.message
+    });
+  }
+});
+
 app.get('/download', async (req, res) => {
   try {
     const { video } = req.query;
@@ -319,13 +443,40 @@ app.get('/download', async (req, res) => {
     console.log('Download request for:', videoUrl);
     
     const videoIdMatch = videoUrl.match(/video\/([a-zA-Z0-9]+)/);
-    const filename = videoIdMatch ? `${videoIdMatch[1]}.m3u8` : 'video.m3u8';
+    const videoId = videoIdMatch ? videoIdMatch[1] : 'video';
     
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const response = await axios.get(videoUrl, {
+      headers: {
+        'User-Agent': headers['User-Agent'],
+        'Referer': 'https://www.dailymotion.com/',
+        'Origin': 'https://www.dailymotion.com',
+      },
+      responseType: 'text',
+      timeout: 30000
+    });
+    
+    let m3u8Content = response.data;
+    const baseUrl = videoUrl.substring(0, videoUrl.lastIndexOf('/') + 1);
+    
+    const lines = m3u8Content.split('\n');
+    const modifiedLines = lines.map(line => {
+      if (line && !line.startsWith('#') && line.trim() !== '') {
+        if (line.startsWith('http')) {
+          return `/proxy?url=${encodeURIComponent(line.trim())}`;
+        } else {
+          return `/proxy?url=${encodeURIComponent(baseUrl + line.trim())}`;
+        }
+      }
+      return line;
+    });
+    
+    m3u8Content = modifiedLines.join('\n');
+    
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Content-Disposition', `attachment; filename="${videoId}.m3u8"`);
+    res.setHeader('Access-Control-Allow-Origin', '*');
     
-    return res.redirect(302, videoUrl);
+    return res.send(m3u8Content);
     
   } catch (error) {
     console.error('Download error:', error.message);
@@ -369,11 +520,7 @@ app.get('/stream/:videoId', async (req, res) => {
       });
     }
     
-    console.log('Redirecting to stream URL');
-    
-    res.setHeader('Content-Disposition', `attachment; filename="${videoId}_${quality}p.m3u8"`);
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    return res.redirect(302, streamUrl);
+    await proxyStream(streamUrl, res, videoId, quality);
     
   } catch (error) {
     console.error('Stream error:', error.message);
