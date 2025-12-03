@@ -3,9 +3,11 @@ const axios = require('axios');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const cron = require('node-cron');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL || process.env.API_URL;
 
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-cache');
@@ -282,6 +284,10 @@ app.get('/', (req, res) => {
         url: 'GET /stream/:videoId?quality=720',
         description: 'Stream HLS pour lecteurs vidéo (VLC, MX Player)',
         exemple: '/stream/x8fme0n?quality=360'
+      },
+      health: {
+        url: 'GET /health',
+        description: 'Vérification de l\'état de l\'API (utilisé pour le keep-alive)'
       }
     },
     exemple: '/recherche?video=Jackie chan film&page=1',
@@ -646,9 +652,32 @@ app.get('/telecharger/:videoId', async (req, res) => {
   }
 });
 
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    message: 'API Dailymotion Scraper est en ligne'
+  });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Serveur démarré sur le port ${PORT}`);
   console.log(`API disponible sur http://0.0.0.0:${PORT}`);
+  
+  if (RENDER_URL) {
+    console.log(`Auto-ping activé pour: ${RENDER_URL}`);
+    cron.schedule('*/14 * * * *', async () => {
+      try {
+        const response = await axios.get(`${RENDER_URL}/health`);
+        console.log(`[Auto-ping] ${new Date().toISOString()} - Status: ${response.status}`);
+      } catch (error) {
+        console.error(`[Auto-ping] Erreur: ${error.message}`);
+      }
+    });
+  } else {
+    console.log('Auto-ping désactivé (définir RENDER_EXTERNAL_URL ou API_URL pour activer)');
+  }
 });
 
 module.exports = app;
