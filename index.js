@@ -107,63 +107,71 @@ function formatDuration(seconds) {
   return `${minutes}m${secs.toString().padStart(2, '0')}s`;
 }
 
-async function searchVideos(query, page = 1, minResults = 15, minDurationMinutes = 60) {
+async function searchVideos(query, page = 1, minResults = 15, minDurationMinutes = 60, fastMode = true) {
   const minDurationSeconds = minDurationMinutes * 60;
   const results = [];
   const seenIds = new Set();
   
-  console.log(`\n=== Recherche: "${query}" - Page: ${page} - Durée min: ${minDurationMinutes}min ===`);
+  const startTime = Date.now();
+  console.log(`\n=== Recherche: "${query}" - Page: ${page} - Durée min: ${minDurationMinutes}min - Mode: ${fastMode ? 'RAPIDE' : 'COMPLET'} ===`);
   
-  // Stratégies de recherche multiples pour trouver plus de résultats
-  const searchStrategies = [
-    { sort: 'relevance', longer: 1 },
-    { sort: 'visited', longer: 1 },
-    { sort: 'recent', longer: 1 },
-    { sort: 'relevance', longer: 0 }
-  ];
-  
-  let currentApiPage = (page - 1) * 3 + 1;
-  let maxApiPages = currentApiPage + 15;
+  let currentApiPage = (page - 1) * 2 + 1;
   let hasMore = true;
   let totalAvailable = 0;
-  let strategyIndex = 0;
   
-  while (results.length < minResults && currentApiPage <= maxApiPages && (hasMore || strategyIndex < searchStrategies.length)) {
-    const strategy = searchStrategies[strategyIndex % searchStrategies.length];
+  try {
+    const apiUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(query)}&fields=id,title,thumbnail_720_url,thumbnail_480_url,thumbnail_url,duration,owner.screenname,views_total&page=${currentApiPage}&limit=100&sort=relevance&longer_than=10`;
     
-    try {
-      // Utilisation de l'API avec paramètre longer_than pour les films
-      const apiUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(query)}&fields=id,title,thumbnail_720_url,thumbnail_480_url,thumbnail_url,duration,owner.screenname,views_total&page=${currentApiPage}&limit=100&sort=${strategy.sort}${strategy.longer ? '&longer_than=20' : ''}`;
+    console.log(`Fetching API...`);
+    
+    const response = await axios.get(apiUrl, {
+      headers: { 'User-Agent': headers['User-Agent'] },
+      timeout: 15000
+    });
+    
+    if (response.data && response.data.list) {
+      const allVideos = response.data.list;
+      totalAvailable = response.data.total || 0;
+      hasMore = response.data.has_more || false;
       
-      console.log(`Fetching API page ${currentApiPage} (${strategy.sort})...`);
+      console.log(`Found ${allVideos.length} videos, total available: ${totalAvailable}`);
       
-      const response = await axios.get(apiUrl, {
-        headers: { 'User-Agent': headers['User-Agent'] },
-        timeout: 20000
-      });
+      const longVideos = allVideos
+        .filter(v => v.duration >= minDurationSeconds && !seenIds.has(v.id))
+        .sort((a, b) => b.duration - a.duration)
+        .slice(0, minResults);
       
-      if (response.data && response.data.list) {
-        const allVideos = response.data.list;
-        totalAvailable = Math.max(totalAvailable, response.data.total || 0);
-        hasMore = response.data.has_more || false;
-        
-        console.log(`Page ${currentApiPage}: ${allVideos.length} videos, total available: ${totalAvailable}`);
-        
-        // Filtrer les vidéos selon la durée minimum demandée
-        const longVideos = allVideos.filter(v => v.duration >= minDurationSeconds && !seenIds.has(v.id));
-        console.log(`Videos >= ${minDurationMinutes}min on this page: ${longVideos.length}`);
-        
-        // Trier par durée décroissante pour prioriser les films complets
-        longVideos.sort((a, b) => b.duration - a.duration);
-        
+      console.log(`Videos >= ${minDurationMinutes}min: ${longVideos.length}`);
+      
+      longVideos.forEach(v => seenIds.add(v.id));
+      
+      if (fastMode) {
         for (const video of longVideos) {
-          if (results.length >= minResults) break;
-          if (seenIds.has(video.id)) continue;
-          seenIds.add(video.id);
+          results.push({
+            titre: video.title || 'Sans titre',
+            image_url: video.thumbnail_720_url || video.thumbnail_480_url || video.thumbnail_url || `https://www.dailymotion.com/thumbnail/video/${video.id}`,
+            video_id: video.id,
+            duree: formatDuration(video.duration),
+            duree_secondes: video.duration,
+            chaine: video['owner.screenname'] || '',
+            vues: video.views_total || 0,
+            page_url: `https://www.dailymotion.com/video/${video.id}`,
+            lien_stream: `/video/${video.id}`
+          });
+        }
+      } else {
+        const batchSize = 5;
+        for (let i = 0; i < longVideos.length; i += batchSize) {
+          const batch = longVideos.slice(i, i + batchSize);
+          const metadataPromises = batch.map(video => 
+            getVideoMetadata(video.id).catch(() => null)
+          );
           
-          try {
-            const metadata = await getVideoMetadata(video.id);
-            const { url_360p, url_720p } = extractVideoUrls(metadata);
+          const metadataResults = await Promise.all(metadataPromises);
+          
+          batch.forEach((video, index) => {
+            const metadata = metadataResults[index];
+            const { url_360p, url_720p } = metadata ? extractVideoUrls(metadata) : { url_360p: null, url_720p: null };
             
             results.push({
               titre: video.title || 'Sans titre',
@@ -178,44 +186,27 @@ async function searchVideos(query, page = 1, minResults = 15, minDurationMinutes
               vues: video.views_total || 0,
               page_url: `https://www.dailymotion.com/video/${video.id}`
             });
-            
-            console.log(`+ [${results.length}] ${video.title?.substring(0, 50)}... (${formatDuration(video.duration)})`);
-          } catch (err) {
-            console.log('Erreur video:', video.id);
-          }
+          });
         }
-      } else {
-        hasMore = false;
       }
       
-      currentApiPage++;
-      
-      // Si pas assez de résultats et plus de pages, essayer une autre stratégie
-      if (!hasMore && results.length < minResults) {
-        strategyIndex++;
-        currentApiPage = 1;
-        hasMore = true;
-      }
-      
-    } catch (error) {
-      console.error('API error:', error.message);
-      strategyIndex++;
-      currentApiPage = 1;
-      hasMore = true;
+      results.forEach((r, i) => console.log(`+ [${i+1}] ${r.titre?.substring(0, 40)}... (${r.duree})`));
     }
+    
+  } catch (error) {
+    console.error('API error:', error.message);
   }
   
-  // Trier les résultats finaux par durée décroissante
-  results.sort((a, b) => b.duree_secondes - a.duree_secondes);
-  
-  console.log(`\nTotal résultats: ${results.length} vidéos >= ${minDurationMinutes}min trouvées`);
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+  console.log(`\nTotal: ${results.length} vidéos en ${elapsed}s`);
   
   return {
     videos: results,
-    hasNextPage: hasMore || results.length >= minResults,
+    hasNextPage: hasMore,
     totalCount: totalAvailable,
     page: page,
-    minDuration: minDurationMinutes
+    minDuration: minDurationMinutes,
+    temps_recherche: `${elapsed}s`
   };
 }
 
@@ -340,26 +331,28 @@ app.get('/', (req, res) => {
 
 app.get('/recherche', async (req, res) => {
   try {
-    const { video, page = 1, duree_min = 60, limit = 15 } = req.query;
+    const { video, page = 1, duree_min = 40, limit = 15, mode = 'rapide' } = req.query;
     
     if (!video) {
       return res.status(400).json({
         erreur: 'Le paramètre video est requis',
-        exemple: '/recherche?video=Film gasy&page=1&duree_min=60',
+        exemple: '/recherche?video=Film gasy&page=1&duree_min=40',
         parametres: {
           video: 'Terme de recherche (obligatoire)',
           page: 'Numéro de page (défaut: 1)',
-          duree_min: 'Durée minimum en minutes (défaut: 60)',
-          limit: 'Nombre de résultats max (défaut: 15)'
+          duree_min: 'Durée minimum en minutes (défaut: 40)',
+          limit: 'Nombre de résultats max (défaut: 15)',
+          mode: 'rapide (défaut) ou complet (avec URLs de streaming)'
         }
       });
     }
     
     const pageNum = parseInt(page) || 1;
-    const minDuration = parseInt(duree_min) || 60;
+    const minDuration = parseInt(duree_min) || 40;
     const maxResults = Math.min(parseInt(limit) || 15, 30);
+    const fastMode = mode !== 'complet';
     
-    const result = await searchVideos(video, pageNum, maxResults, minDuration);
+    const result = await searchVideos(video, pageNum, maxResults, minDuration, fastMode);
     
     res.json({
       recherche: video,
@@ -367,8 +360,10 @@ app.get('/recherche', async (req, res) => {
       total_resultats: result.videos.length,
       total_disponible: result.totalCount,
       page_suivante: result.hasNextPage,
+      temps_recherche: result.temps_recherche,
       filtre: `Durée minimum ${minDuration} minutes`,
-      qualites: ['360p', '720p'],
+      mode: fastMode ? 'rapide' : 'complet',
+      note: fastMode ? 'Utilisez /video/:id pour obtenir les URLs de streaming' : null,
       resultats: result.videos
     });
     
