@@ -107,23 +107,35 @@ function formatDuration(seconds) {
   return `${minutes}m${secs.toString().padStart(2, '0')}s`;
 }
 
-async function searchVideos(query, page = 1, minResults = 10) {
-  const minDurationSeconds = 90 * 60;
+async function searchVideos(query, page = 1, minResults = 15, minDurationMinutes = 60) {
+  const minDurationSeconds = minDurationMinutes * 60;
   const results = [];
   const seenIds = new Set();
   
-  console.log(`\n=== Recherche: "${query}" - Page: ${page} ===`);
+  console.log(`\n=== Recherche: "${query}" - Page: ${page} - Durée min: ${minDurationMinutes}min ===`);
   
-  let currentApiPage = (page - 1) * 5 + 1;
-  let maxApiPages = currentApiPage + 10;
+  // Stratégies de recherche multiples pour trouver plus de résultats
+  const searchStrategies = [
+    { sort: 'relevance', longer: 1 },
+    { sort: 'visited', longer: 1 },
+    { sort: 'recent', longer: 1 },
+    { sort: 'relevance', longer: 0 }
+  ];
+  
+  let currentApiPage = (page - 1) * 3 + 1;
+  let maxApiPages = currentApiPage + 15;
   let hasMore = true;
   let totalAvailable = 0;
+  let strategyIndex = 0;
   
-  while (results.length < minResults && currentApiPage <= maxApiPages && hasMore) {
+  while (results.length < minResults && currentApiPage <= maxApiPages && (hasMore || strategyIndex < searchStrategies.length)) {
+    const strategy = searchStrategies[strategyIndex % searchStrategies.length];
+    
     try {
-      const apiUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(query)}&fields=id,title,thumbnail_720_url,thumbnail_480_url,thumbnail_url,duration,owner.screenname&page=${currentApiPage}&limit=100&sort=relevance`;
+      // Utilisation de l'API avec paramètre longer_than pour les films
+      const apiUrl = `https://api.dailymotion.com/videos?search=${encodeURIComponent(query)}&fields=id,title,thumbnail_720_url,thumbnail_480_url,thumbnail_url,duration,owner.screenname,views_total&page=${currentApiPage}&limit=100&sort=${strategy.sort}${strategy.longer ? '&longer_than=20' : ''}`;
       
-      console.log(`Fetching API page ${currentApiPage}...`);
+      console.log(`Fetching API page ${currentApiPage} (${strategy.sort})...`);
       
       const response = await axios.get(apiUrl, {
         headers: { 'User-Agent': headers['User-Agent'] },
@@ -132,13 +144,17 @@ async function searchVideos(query, page = 1, minResults = 10) {
       
       if (response.data && response.data.list) {
         const allVideos = response.data.list;
-        totalAvailable = response.data.total || 0;
+        totalAvailable = Math.max(totalAvailable, response.data.total || 0);
         hasMore = response.data.has_more || false;
         
         console.log(`Page ${currentApiPage}: ${allVideos.length} videos, total available: ${totalAvailable}`);
         
+        // Filtrer les vidéos selon la durée minimum demandée
         const longVideos = allVideos.filter(v => v.duration >= minDurationSeconds && !seenIds.has(v.id));
-        console.log(`Videos >= 1h30 on this page: ${longVideos.length}`);
+        console.log(`Videos >= ${minDurationMinutes}min on this page: ${longVideos.length}`);
+        
+        // Trier par durée décroissante pour prioriser les films complets
+        longVideos.sort((a, b) => b.duration - a.duration);
         
         for (const video of longVideos) {
           if (results.length >= minResults) break;
@@ -159,6 +175,7 @@ async function searchVideos(query, page = 1, minResults = 10) {
               duree_secondes: video.duration,
               qualites_disponibles: [url_360p ? '360p' : null, url_720p ? '720p' : null].filter(Boolean),
               chaine: video['owner.screenname'] || '',
+              vues: video.views_total || 0,
               page_url: `https://www.dailymotion.com/video/${video.id}`
             });
             
@@ -173,19 +190,32 @@ async function searchVideos(query, page = 1, minResults = 10) {
       
       currentApiPage++;
       
+      // Si pas assez de résultats et plus de pages, essayer une autre stratégie
+      if (!hasMore && results.length < minResults) {
+        strategyIndex++;
+        currentApiPage = 1;
+        hasMore = true;
+      }
+      
     } catch (error) {
       console.error('API error:', error.message);
-      break;
+      strategyIndex++;
+      currentApiPage = 1;
+      hasMore = true;
     }
   }
   
-  console.log(`\nTotal résultats: ${results.length} vidéos longues durées trouvées`);
+  // Trier les résultats finaux par durée décroissante
+  results.sort((a, b) => b.duree_secondes - a.duree_secondes);
+  
+  console.log(`\nTotal résultats: ${results.length} vidéos >= ${minDurationMinutes}min trouvées`);
   
   return {
     videos: results,
     hasNextPage: hasMore || results.length >= minResults,
     totalCount: totalAvailable,
-    page: page
+    page: page,
+    minDuration: minDurationMinutes
   };
 }
 
@@ -264,11 +294,17 @@ async function proxyStream(url, res, videoId, quality) {
 app.get('/', (req, res) => {
   res.json({
     message: 'Dailymotion Scraper API',
-    description: 'API pour rechercher des vidéos Dailymotion de longue durée (1h30+) en qualité 360p ou 720p',
+    description: 'API pour rechercher des vidéos Dailymotion de longue durée (films) en qualité 360p ou 720p',
     endpoints: {
       recherche: {
-        url: 'GET /recherche?video=QUERY&page=1',
-        description: 'Recherche des vidéos par mot-clé avec pagination'
+        url: 'GET /recherche?video=QUERY&page=1&duree_min=60&limit=15',
+        description: 'Recherche des vidéos par mot-clé avec pagination et filtrage par durée',
+        parametres: {
+          video: 'Terme de recherche (obligatoire)',
+          page: 'Numéro de page (défaut: 1)',
+          duree_min: 'Durée minimum en minutes (défaut: 60)',
+          limit: 'Nombre de résultats max (défaut: 15, max: 30)'
+        }
       },
       video: {
         url: 'GET /video/:id',
@@ -290,9 +326,13 @@ app.get('/', (req, res) => {
         description: 'Vérification de l\'état de l\'API (utilisé pour le keep-alive)'
       }
     },
-    exemple: '/recherche?video=Jackie chan film&page=1',
+    exemples: [
+      '/recherche?video=Film gasy&page=1',
+      '/recherche?video=Film gasy&duree_min=60',
+      '/recherche?video=Jackie chan film&duree_min=90&limit=20'
+    ],
     filtres: {
-      duree_minimum: '1h30 (90 minutes)',
+      duree_minimum: '60 minutes (configurable avec duree_min)',
       qualites: ['360p (basse qualité)', '720p (haute qualité)']
     }
   });
@@ -300,17 +340,26 @@ app.get('/', (req, res) => {
 
 app.get('/recherche', async (req, res) => {
   try {
-    const { video, page = 1 } = req.query;
+    const { video, page = 1, duree_min = 60, limit = 15 } = req.query;
     
     if (!video) {
       return res.status(400).json({
         erreur: 'Le paramètre video est requis',
-        exemple: '/recherche?video=Jackie chan film&page=1'
+        exemple: '/recherche?video=Film gasy&page=1&duree_min=60',
+        parametres: {
+          video: 'Terme de recherche (obligatoire)',
+          page: 'Numéro de page (défaut: 1)',
+          duree_min: 'Durée minimum en minutes (défaut: 60)',
+          limit: 'Nombre de résultats max (défaut: 15)'
+        }
       });
     }
     
     const pageNum = parseInt(page) || 1;
-    const result = await searchVideos(video, pageNum, 10);
+    const minDuration = parseInt(duree_min) || 60;
+    const maxResults = Math.min(parseInt(limit) || 15, 30);
+    
+    const result = await searchVideos(video, pageNum, maxResults, minDuration);
     
     res.json({
       recherche: video,
@@ -318,7 +367,7 @@ app.get('/recherche', async (req, res) => {
       total_resultats: result.videos.length,
       total_disponible: result.totalCount,
       page_suivante: result.hasNextPage,
-      filtre: 'Durée minimum 1h30 (90 minutes)',
+      filtre: `Durée minimum ${minDuration} minutes`,
       qualites: ['360p', '720p'],
       resultats: result.videos
     });
