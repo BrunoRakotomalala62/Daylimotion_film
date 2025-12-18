@@ -107,6 +107,47 @@ function formatDuration(seconds) {
   return `${minutes}m${secs.toString().padStart(2, '0')}s`;
 }
 
+function calculateTitleRelevance(title, query) {
+  if (!title || !query) return 0;
+  
+  const titleLower = title.toLowerCase();
+  const queryLower = query.toLowerCase();
+  const queryTerms = queryLower.split(/\s+/).filter(t => t.length > 0);
+  
+  let score = 0;
+  
+  // Exact phrase match - highest priority
+  if (titleLower.includes(queryLower)) {
+    score += 1000;
+  }
+  
+  // Count matching terms
+  let matchedTerms = 0;
+  for (const term of queryTerms) {
+    if (titleLower.includes(term)) {
+      matchedTerms++;
+      // Bonus if term appears near the beginning
+      if (titleLower.indexOf(term) < 20) {
+        score += 100;
+      } else {
+        score += 50;
+      }
+    }
+  }
+  
+  // Must have at least one term match
+  if (matchedTerms === 0) {
+    return -1;
+  }
+  
+  // Bonus for matching all terms
+  if (matchedTerms === queryTerms.length) {
+    score += 500;
+  }
+  
+  return score;
+}
+
 async function searchVideos(query, page = 1, minResults = 15, minDurationMinutes = 60, fastMode = true) {
   const minDurationSeconds = minDurationMinutes * 60;
   const results = [];
@@ -138,7 +179,12 @@ async function searchVideos(query, page = 1, minResults = 15, minDurationMinutes
       
       const longVideos = allVideos
         .filter(v => v.duration >= minDurationSeconds && !seenIds.has(v.id))
-        .sort((a, b) => b.duration - a.duration)
+        .map(v => ({
+          ...v,
+          relevanceScore: calculateTitleRelevance(v.title, query)
+        }))
+        .filter(v => v.relevanceScore >= 0)
+        .sort((a, b) => b.relevanceScore - a.relevanceScore)
         .slice(0, minResults);
       
       console.log(`Videos >= ${minDurationMinutes}min: ${longVideos.length}`);
